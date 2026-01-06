@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt6.QtCore import (Qt, pyqtSignal, QThread, QMimeData, QObject, pyqtSlot, QRunnable,
                           QThreadPool, QTimer, QCoreApplication, QRect, QSize, QUrl)
 from PyQt6.QtGui import (QPixmap, QDragEnterEvent, QDropEvent, QDrag, QAction, QCursor,
-                         QTextCursor, QColor, QPalette, QIcon, QFont, QPainter, QAction, QDesktopServices)
+                         QTextCursor, QColor, QPalette, QIcon, QFont, QPainter, QDesktopServices)
 
 # ==========================================
 # 0. 全局配置与工具
