@@ -18,10 +18,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QGridLayout, QComboBox, QProgressBar, QLineEdit, QMessageBox, 
                              QDialog, QFormLayout, QFileDialog, QGroupBox, QSplitter, QSpinBox, 
                              QMenu, QCheckBox, QTabWidget, QGraphicsDropShadowEffect, QSizePolicy)
-from PyQt6.QtCore import (Qt, pyqtSignal, QThread, QMimeData, QObject, pyqtSlot, QRunnable, 
-                          QThreadPool, QTimer, QCoreApplication, QRect, QSize)
-from PyQt6.QtGui import (QPixmap, QDragEnterEvent, QDropEvent, QDrag, QAction, QCursor, 
-                         QTextCursor, QColor, QPalette, QIcon, QFont, QPainter, QAction)
+from PyQt6.QtCore import (Qt, pyqtSignal, QThread, QMimeData, QObject, pyqtSlot, QRunnable,
+                          QThreadPool, QTimer, QCoreApplication, QRect, QSize, QUrl)
+from PyQt6.QtGui import (QPixmap, QDragEnterEvent, QDropEvent, QDrag, QAction, QCursor,
+                         QTextCursor, QColor, QPalette, QIcon, QFont, QPainter, QAction, QDesktopServices)
 
 # ==========================================
 # 0. 全局配置与工具
@@ -861,12 +861,14 @@ class MainWindow(QMainWindow):
         
         # 2. Main Workspace
         gc = QGroupBox("🎬 Director Workspace"); cl = QVBoxLayout(gc)
-        hbox = QHBoxLayout(); self.inp_vid = QLineEdit(); self.inp_vid.setPlaceholderText("Video Path..."); self.inp_vid.setAcceptDrops(True)
+        hbox = QHBoxLayout(); self.inp_vid = QLineEdit(); self.inp_vid.setPlaceholderText("Video Path..."); self.inp_vid.setToolTip("拖拽或粘贴视频路径以便快速分析")
+        self.inp_vid.setAcceptDrops(True)
         self.inp_vid.dragEnterEvent = lambda e: e.accept() if e.mimeData().hasUrls() else e.ignore()
         self.inp_vid.dropEvent = lambda e: self.inp_vid.setText(e.mimeData().urls()[0].toLocalFile())
         hbox.addWidget(QLabel("Highlight Count:")); self.sp_ana_cnt = QSpinBox(); self.sp_ana_cnt.setRange(1,12); self.sp_ana_cnt.setValue(4)
         hbox.addWidget(self.sp_ana_cnt)
-        btn_an = QPushButton("🔍 Smart Extract"); btn_an.clicked.connect(self.run_analyze)
+        btn_an = QPushButton("🔍 Smart Extract"); btn_an.setToolTip("从视频中自动提取精彩片段并生成分镜")
+        btn_an.clicked.connect(self.run_analyze)
         hbox.addWidget(self.inp_vid); hbox.addWidget(btn_an); cl.addLayout(hbox)
         
         self.tab_widget = QTabWidget()
@@ -879,7 +881,10 @@ class MainWindow(QMainWindow):
         btn_imp = QPushButton("📥 Import Image"); btn_imp.clicked.connect(self.import_storyboard_image)
         btn_bat = QPushButton("🎨 Batch Draw"); btn_bat.setObjectName("PrimaryBtn"); btn_bat.clicked.connect(self.batch_remake)
         btn_cls = QPushButton("🗑️ Delete All"); btn_cls.setObjectName("DangerBtn"); btn_cls.clicked.connect(self.clear_all_storyboards)
-        manage_box.addWidget(btn_imp); manage_box.addWidget(btn_bat); manage_box.addStretch(); manage_box.addWidget(btn_cls)
+        btn_open_out = QPushButton("📂 Open Storyboards")
+        btn_open_out.setToolTip("打开分镜输出文件夹，便捷查看最新生成的图片")
+        btn_open_out.clicked.connect(lambda: self.open_dir(self.out_dir))
+        manage_box.addWidget(btn_imp); manage_box.addWidget(btn_bat); manage_box.addWidget(btn_open_out); manage_box.addStretch(); manage_box.addWidget(btn_cls)
         l_sb.addWidget(self.sc_sb); l_sb.addLayout(manage_box)
         self.tab_widget.addTab(tab_sb, "🖼️ Storyboard")
         
@@ -910,7 +915,8 @@ class MainWindow(QMainWindow):
         # Restore Models
         self.cb_agent = QComboBox(); self.cb_agent.setEditable(True); self.cb_agent.addItems(["gemini-3-pro", "gemini-2.5-pro", "gemini-2.5-flash"]); fl1.addRow("Model:", self.cb_agent)
         self.sp_cnt = QSpinBox(); self.sp_cnt.setRange(1,30); self.sp_cnt.setValue(4); fl1.addRow("Count:", self.sp_cnt)
-        self.btn_ag = QPushButton("🚀 Split & Gen"); self.btn_ag.setObjectName("PrimaryBtn"); self.btn_ag.clicked.connect(self.run_agent_flow)
+        self.btn_ag = QPushButton("🚀 Split & Gen"); self.btn_ag.setObjectName("PrimaryBtn"); self.btn_ag.setToolTip("根据故事创意自动拆分分镜并绘制")
+        self.btn_ag.clicked.connect(self.run_agent_flow)
         fl1.addRow(self.btn_ag); g1.setLayout(fl1); rl.addWidget(g1)
         
         g2 = QGroupBox("🎨 Image"); fl2 = QFormLayout()
@@ -924,6 +930,10 @@ class MainWindow(QMainWindow):
         self.cb_vr = QComboBox(); self.cb_vr.addItems(["16:9", "9:16"]); fl3.addRow("Ratio:", self.cb_vr)
         btn_optimize = QPushButton("✨ Auto Prompt"); btn_optimize.clicked.connect(self.run_prompt_optimization); fl3.addRow(btn_optimize)
         btn_vid = QPushButton("🎬 Batch Video"); btn_vid.setObjectName("PrimaryBtn"); btn_vid.clicked.connect(self.run_video_flow); fl3.addRow(btn_vid)
+        btn_open_video = QPushButton("📂 Open Videos")
+        btn_open_video.setToolTip("快速打开视频输出文件夹，查看生成结果")
+        btn_open_video.clicked.connect(lambda: self.open_dir(self.out_dir_video))
+        fl3.addRow(btn_open_video)
         self.lbl_vid_progress = QLabel("Prog: -/-"); fl3.addRow(self.lbl_vid_progress)
         g3.setLayout(fl3); rl.addWidget(g3); rl.addStretch(); tl.addWidget(fr)
         
@@ -985,8 +995,15 @@ class MainWindow(QMainWindow):
         self.grid_as.removeWidget(widget); widget.deleteLater()
         if widget.path in self.asset_paths: self.asset_paths.remove(widget.path)
     def clear_assets(self):
-        for i in reversed(range(self.grid_as.count())): w = self.grid_as.itemAt(i).widget(); 
-        if w: w.deleteLater()
+        if not self.asset_paths:
+            return
+        resp = QMessageBox.question(self, "Confirm", "确定要清空已导入的素材吗？这不会删除磁盘上的文件。", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        for i in reversed(range(self.grid_as.count())):
+            w = self.grid_as.itemAt(i).widget()
+            if w:
+                w.deleteLater()
         self.asset_paths.clear()
     def get_all_assets(self): return self.asset_paths
 
@@ -1016,8 +1033,19 @@ class MainWindow(QMainWindow):
             self.grid_sb.addWidget(card, i//3, i%3)
 
     def clear_all_storyboards(self):
-        for c in self.storyboard_cards: c.deleteLater()
+        if not self.storyboard_cards:
+            return
+        resp = QMessageBox.question(self, "Confirm", "删除所有分镜卡片？此操作不可撤销。", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        for c in self.storyboard_cards:
+            c.deleteLater()
         self.storyboard_cards.clear(); self.refresh_sb_grid()
+
+    def open_dir(self, path):
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def import_storyboard_image(self):
         f, _ = QFileDialog.getOpenFileName(self, "Import", "", "Images (*.png *.jpg)")
