@@ -19,9 +19,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QDialog, QFormLayout, QFileDialog, QGroupBox, QSplitter, QSpinBox, 
                              QMenu, QCheckBox, QTabWidget, QGraphicsDropShadowEffect, QSizePolicy)
 from PyQt6.QtCore import (Qt, pyqtSignal, QThread, QMimeData, QObject, pyqtSlot, QRunnable,
-                          QThreadPool, QTimer, QCoreApplication, QRect, QSize, QUrl)
+                          QThreadPool, QTimer, QCoreApplication, QSize, QUrl)
 from PyQt6.QtGui import (QPixmap, QDragEnterEvent, QDropEvent, QDrag, QAction, QCursor,
-                         QTextCursor, QColor, QPalette, QIcon, QFont, QPainter, QDesktopServices)
+                         QTextCursor, QColor, QPalette, QIcon, QPainter, QDesktopServices)
 
 # ==========================================
 # 0. 全局配置与工具
@@ -112,12 +112,14 @@ class APIClient:
         cleaned = re.sub(r'```', '', cleaned)
         return cleaned.strip()
 
-    def upload_imgbb(self, file_path):
+    def upload_imgbb(self, file_path, name=None):
         if not self.imgbb_key: raise Exception("缺少 ImgBB Key")
         if str(file_path).startswith("http"): return file_path
         try:
             with open(file_path, "rb") as file:
                 payload = {"key": self.imgbb_key}
+                if name:
+                    payload["name"] = str(name)
                 files = {"image": file}
                 res = requests.post(URL_IMGBB, data=payload, files=files, timeout=60)
                 res.raise_for_status()
@@ -275,9 +277,9 @@ class ScriptAnalysisThread(QThread):
         self.log_signal.emit("STEP", "🎬 Script Analysis Started...")
         ref_urls = []
         if self.assets:
-            for path in self.assets:
+            for idx, path in enumerate(self.assets, start=1):
                 if not self.is_running: return
-                u = self.c.upload_imgbb(path)
+                u = self.c.upload_imgbb(path, name=idx)
                 if u: ref_urls.append(u)
         for chunk in self.c.stream_video_script(self.vp, self.m, self.prompt, ref_urls):
             if not self.is_running: break
@@ -317,8 +319,8 @@ class AgentProcessThread(QThread):
             self.log_signal.emit("STEP", f"🚀 Agent: {self.m}")
             ref_urls = []
             if self.assets:
-                for path in self.assets:
-                    u = self.c.upload_imgbb(path)
+                for idx, path in enumerate(self.assets, start=1):
+                    u = self.c.upload_imgbb(path, name=idx)
                     if u: ref_urls.append(u)
             prompts = self.c.agent_multimodal_split(self.s, self.n, self.m, ref_urls) if ref_urls else self.c.chat_split_script(self.s, self.n, self.m)
             if prompts: self.finished_signal.emit(prompts, ref_urls)
@@ -335,9 +337,9 @@ class ImageGenTask(QRunnable):
         try:
             final_urls = []
             if self.urls:
-                for path in self.urls:
+                for idx, path in enumerate(self.urls, start=1):
                     if os.path.exists(path):
-                        u = self.c.upload_imgbb(path)
+                        u = self.c.upload_imgbb(path, name=idx)
                         if u: final_urls.append(u)
                     elif str(path).startswith("http"): final_urls.append(path)
             payload = {"model": self.m, "prompt": self.p, "aspectRatio": self.r, "imageSize": self.s, "urls": final_urls, "webHook": "-1", "shutProgress": False}
@@ -517,39 +519,18 @@ class LogConsole(QTextEdit):
 
 class AssetLabel(QLabel):
     delete_signal = pyqtSignal(object)
-    def __init__(self, path, index=0):
+    def __init__(self, path):
         super().__init__()
-        self.path = path
-        self.index = index
-        self.setFixedSize(100, 100)
+        self.path = path; self.setFixedSize(100, 100)
         self.setStyleSheet("""border: 2px solid #3f3f46; background-color: #27272a; border-radius: 8px;""")
         pix = QPixmap(path)
         if not pix.isNull():
             self.setPixmap(pix.scaled(100, 100, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-    def set_index_badge(self, index):
-        self.index = index
-        self.update()
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if self.index:
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            badge_rect = QRect(6, 6, 28, 20)
-            painter.setBrush(QColor(59, 130, 246, 200))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRoundedRect(badge_rect, 6, 6)
-            painter.setPen(QColor(255, 255, 255))
-            painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, f"A{self.index}")
-
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         del_act = menu.addAction("🗑️ Delete")
-        if menu.exec(self.mapToGlobal(event.pos())) == del_act:
-            self.delete_signal.emit(self)
+        if menu.exec(self.mapToGlobal(event.pos())) == del_act: self.delete_signal.emit(self)
 
 class FullScreenViewer(QDialog):
     def __init__(self, image_path, parent=None):
@@ -575,7 +556,6 @@ class ZoomImageLabel(QLabel):
         self.cached_pixmap = None
         self.upload_handler = None
         self.placeholder_text = text
-        self.badge_text = None
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setAcceptDrops(True)
@@ -601,10 +581,6 @@ class ZoomImageLabel(QLabel):
             self.cached_pixmap = QPixmap(path)
             self.setText("")
             self.setStyleSheet("background-color: #000000; border-radius: 6px; color: #52525b; font-size: 11px;")
-        self.update()
-
-    def set_index_badge(self, text):
-        self.badge_text = text
         self.update()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -637,16 +613,6 @@ class ZoomImageLabel(QLabel):
             painter.drawPixmap(x, y, scaled)
         else:
             super().paintEvent(event)
-        if self.badge_text:
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            badge_rect = QRect(8, 8, 34, 22)
-            painter.setBrush(QColor(59, 130, 246, 210))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRoundedRect(badge_rect, 8, 8)
-            painter.setPen(QColor(255, 255, 255))
-            painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, self.badge_text)
 
     def mouseDoubleClickEvent(self, event):
         if self.full_path and os.path.exists(self.full_path):
@@ -707,7 +673,6 @@ class StoryboardCard(QWidget):
         
         self.img = ZoomImageLabel("＋ 上传首帧 (点击或拖拽)")
         self.img.setFixedHeight(160)
-        self.img.set_index_badge(f"S{index}")
         self.img.clear_signal.connect(lambda: self.set_image_by_target(None, "start"))
         self.img.set_upload_handler(lambda path=None: self.handle_upload("start", path), "＋ 上传首帧 (点击或拖拽)")
         l_start.addWidget(self.img)
@@ -737,7 +702,6 @@ class StoryboardCard(QWidget):
         
         self.img_end_preview = ZoomImageLabel("＋ 上传尾帧 (点击或拖拽)")
         self.img_end_preview.setFixedHeight(160)
-        self.img_end_preview.set_index_badge(f"E{index}")
         self.img_end_preview.clear_signal.connect(lambda: self.set_image_by_target(None, "end"))
         self.img_end_preview.set_upload_handler(lambda path=None: self.handle_upload("end", path), "＋ 上传尾帧 (点击或拖拽)")
         l_end.addWidget(self.img_end_preview)
@@ -895,10 +859,6 @@ class StoryboardCard(QWidget):
     def update_prompt(self, new_text): 
         self.txt_start.setText(str(new_text)); self.lbl_st.setText("✨ Optimized")
 
-    def update_index_badges(self, index):
-        self.chk_sel.setText(f"No.{index}")
-        self.img.set_index_badge(f"S{index}")
-        self.img_end_preview.set_index_badge(f"E{index}")
         
     @pyqtSlot(object)
     def on_image_success(self, result_tuple):
@@ -929,9 +889,7 @@ class MainWindow(QMainWindow):
         self.out_dir = ensure_dir("Storyboards_Output")
         self.out_dir_video = ensure_dir("Final_Videos") 
         ensure_dir("Highlights")
-        self.asset_paths = []
-        self.asset_cards = []
-        self.storyboard_cards = []
+        self.asset_paths = []; self.storyboard_cards = []
         self.setup_ui(); self.apply_theme()
         if not self.client.grsai_key: global_logger.warn("⚠️ Please Config API Key")
         else: global_logger.info(f"✅ System Ready")
@@ -1119,36 +1077,24 @@ class MainWindow(QMainWindow):
     def add_asset_card(self, path):
         if path in self.asset_paths: return
         self.asset_paths.append(path)
-        lbl = AssetLabel(path, len(self.asset_paths)); lbl.delete_signal.connect(self.remove_asset)
-        self.asset_cards.append(lbl)
-        self.refresh_asset_grid()
+        lbl = AssetLabel(path); lbl.delete_signal.connect(self.remove_asset)
+        c = self.grid_as.count(); self.grid_as.addWidget(lbl, c//2, c%2)
         global_logger.info(f"➕ Asset: {os.path.basename(path)}")
     def remove_asset(self, widget):
         self.grid_as.removeWidget(widget); widget.deleteLater()
         if widget.path in self.asset_paths: self.asset_paths.remove(widget.path)
-        if widget in self.asset_cards: self.asset_cards.remove(widget)
-        self.refresh_asset_grid()
     def clear_assets(self):
         if not self.asset_paths:
             return
         resp = QMessageBox.question(self, "Confirm", "确定要清空已导入的素材吗？这不会删除磁盘上的文件。", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if resp != QMessageBox.StandardButton.Yes:
             return
-        for card in self.asset_cards:
-            card.deleteLater()
-        self.asset_cards.clear()
+        for i in reversed(range(self.grid_as.count())):
+            w = self.grid_as.itemAt(i).widget()
+            if w:
+                w.deleteLater()
         self.asset_paths.clear()
-        self.refresh_asset_grid()
     def get_all_assets(self): return self.asset_paths
-
-    def refresh_asset_grid(self):
-        while self.grid_as.count():
-            item = self.grid_as.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
-        for i, card in enumerate(self.asset_cards, start=1):
-            card.set_index_badge(i)
-            self.grid_as.addWidget(card, (i - 1) // 2, (i - 1) % 2)
 
     def add_sb_card(self, prompt, ref_urls, img_path=None):
         if isinstance(prompt, dict): prompt = prompt.get('description') or prompt.get('prompt') or str(prompt)
@@ -1172,7 +1118,7 @@ class MainWindow(QMainWindow):
             item = self.grid_sb.takeAt(0)
             if item.widget(): item.widget().setParent(None)
         for i, card in enumerate(self.storyboard_cards):
-            card.update_index_badges(i + 1)
+            card.chk_sel.setText(f"No.{i+1}")
             self.grid_sb.addWidget(card, i//3, i%3)
 
     def reorder_cards(self, src_idx, target_idx):
