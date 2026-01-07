@@ -516,19 +516,40 @@ class LogConsole(QTextEdit):
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
 class AssetLabel(QLabel):
-    delete_signal = pyqtSignal(object) 
-    def __init__(self, path):
+    delete_signal = pyqtSignal(object)
+    def __init__(self, path, index=0):
         super().__init__()
-        self.path = path; self.setFixedSize(100, 100)
+        self.path = path
+        self.index = index
+        self.setFixedSize(100, 100)
         self.setStyleSheet("""border: 2px solid #3f3f46; background-color: #27272a; border-radius: 8px;""")
         pix = QPixmap(path)
         if not pix.isNull():
             self.setPixmap(pix.scaled(100, 100, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def set_index_badge(self, index):
+        self.index = index
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.index:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            badge_rect = QRect(6, 6, 28, 20)
+            painter.setBrush(QColor(59, 130, 246, 200))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(badge_rect, 6, 6)
+            painter.setPen(QColor(255, 255, 255))
+            painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, f"A{self.index}")
+
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         del_act = menu.addAction("🗑️ Delete")
-        if menu.exec(self.mapToGlobal(event.pos())) == del_act: self.delete_signal.emit(self)
+        if menu.exec(self.mapToGlobal(event.pos())) == del_act:
+            self.delete_signal.emit(self)
 
 class FullScreenViewer(QDialog):
     def __init__(self, image_path, parent=None):
@@ -554,6 +575,7 @@ class ZoomImageLabel(QLabel):
         self.cached_pixmap = None
         self.upload_handler = None
         self.placeholder_text = text
+        self.badge_text = None
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setAcceptDrops(True)
@@ -579,6 +601,10 @@ class ZoomImageLabel(QLabel):
             self.cached_pixmap = QPixmap(path)
             self.setText("")
             self.setStyleSheet("background-color: #000000; border-radius: 6px; color: #52525b; font-size: 11px;")
+        self.update()
+
+    def set_index_badge(self, text):
+        self.badge_text = text
         self.update()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -611,6 +637,16 @@ class ZoomImageLabel(QLabel):
             painter.drawPixmap(x, y, scaled)
         else:
             super().paintEvent(event)
+        if self.badge_text:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            badge_rect = QRect(8, 8, 34, 22)
+            painter.setBrush(QColor(59, 130, 246, 210))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(badge_rect, 8, 8)
+            painter.setPen(QColor(255, 255, 255))
+            painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, self.badge_text)
 
     def mouseDoubleClickEvent(self, event):
         if self.full_path and os.path.exists(self.full_path):
@@ -671,6 +707,7 @@ class StoryboardCard(QWidget):
         
         self.img = ZoomImageLabel("＋ 上传首帧 (点击或拖拽)")
         self.img.setFixedHeight(160)
+        self.img.set_index_badge(f"S{index}")
         self.img.clear_signal.connect(lambda: self.set_image_by_target(None, "start"))
         self.img.set_upload_handler(lambda path=None: self.handle_upload("start", path), "＋ 上传首帧 (点击或拖拽)")
         l_start.addWidget(self.img)
@@ -700,6 +737,7 @@ class StoryboardCard(QWidget):
         
         self.img_end_preview = ZoomImageLabel("＋ 上传尾帧 (点击或拖拽)")
         self.img_end_preview.setFixedHeight(160)
+        self.img_end_preview.set_index_badge(f"E{index}")
         self.img_end_preview.clear_signal.connect(lambda: self.set_image_by_target(None, "end"))
         self.img_end_preview.set_upload_handler(lambda path=None: self.handle_upload("end", path), "＋ 上传尾帧 (点击或拖拽)")
         l_end.addWidget(self.img_end_preview)
@@ -856,6 +894,11 @@ class StoryboardCard(QWidget):
 
     def update_prompt(self, new_text): 
         self.txt_start.setText(str(new_text)); self.lbl_st.setText("✨ Optimized")
+
+    def update_index_badges(self, index):
+        self.chk_sel.setText(f"No.{index}")
+        self.img.set_index_badge(f"S{index}")
+        self.img_end_preview.set_index_badge(f"E{index}")
         
     @pyqtSlot(object)
     def on_image_success(self, result_tuple):
@@ -886,7 +929,9 @@ class MainWindow(QMainWindow):
         self.out_dir = ensure_dir("Storyboards_Output")
         self.out_dir_video = ensure_dir("Final_Videos") 
         ensure_dir("Highlights")
-        self.asset_paths = []; self.storyboard_cards = []
+        self.asset_paths = []
+        self.asset_cards = []
+        self.storyboard_cards = []
         self.setup_ui(); self.apply_theme()
         if not self.client.grsai_key: global_logger.warn("⚠️ Please Config API Key")
         else: global_logger.info(f"✅ System Ready")
@@ -940,11 +985,14 @@ class MainWindow(QMainWindow):
         self.inp_vid.setAcceptDrops(True)
         self.inp_vid.dragEnterEvent = lambda e: e.accept() if e.mimeData().hasUrls() else e.ignore()
         self.inp_vid.dropEvent = lambda e: self.inp_vid.setText(e.mimeData().urls()[0].toLocalFile())
+        btn_pick_vid = QPushButton("📂 Select Video")
+        btn_pick_vid.setToolTip("选择本地视频文件上传")
+        btn_pick_vid.clicked.connect(self.pick_video_file)
         hbox.addWidget(QLabel("Highlight Count:")); self.sp_ana_cnt = QSpinBox(); self.sp_ana_cnt.setRange(1,12); self.sp_ana_cnt.setValue(4)
         hbox.addWidget(self.sp_ana_cnt)
         btn_an = QPushButton("🔍 Smart Extract"); btn_an.setToolTip("从视频中自动提取精彩片段并生成分镜")
         btn_an.clicked.connect(self.run_analyze)
-        hbox.addWidget(self.inp_vid); hbox.addWidget(btn_an); cl.addLayout(hbox)
+        hbox.addWidget(self.inp_vid); hbox.addWidget(btn_pick_vid); hbox.addWidget(btn_an); cl.addLayout(hbox)
         
         self.tab_widget = QTabWidget()
         
@@ -1058,6 +1106,11 @@ class MainWindow(QMainWindow):
         c.insertText(chunk)
         self.txt_script_out.setTextCursor(c)
 
+    def pick_video_file(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Videos (*.mp4 *.mov *.mkv *.avi)")
+        if f:
+            self.inp_vid.setText(f)
+
     def upload_as(self):
         f, _ = QFileDialog.getOpenFileName(self, "Img", "", "Images (*.png *.jpg *.jpeg)")
         if f: self.add_asset_card(f)
@@ -1066,24 +1119,36 @@ class MainWindow(QMainWindow):
     def add_asset_card(self, path):
         if path in self.asset_paths: return
         self.asset_paths.append(path)
-        lbl = AssetLabel(path); lbl.delete_signal.connect(self.remove_asset)
-        c = self.grid_as.count(); self.grid_as.addWidget(lbl, c//2, c%2)
+        lbl = AssetLabel(path, len(self.asset_paths)); lbl.delete_signal.connect(self.remove_asset)
+        self.asset_cards.append(lbl)
+        self.refresh_asset_grid()
         global_logger.info(f"➕ Asset: {os.path.basename(path)}")
     def remove_asset(self, widget):
         self.grid_as.removeWidget(widget); widget.deleteLater()
         if widget.path in self.asset_paths: self.asset_paths.remove(widget.path)
+        if widget in self.asset_cards: self.asset_cards.remove(widget)
+        self.refresh_asset_grid()
     def clear_assets(self):
         if not self.asset_paths:
             return
         resp = QMessageBox.question(self, "Confirm", "确定要清空已导入的素材吗？这不会删除磁盘上的文件。", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if resp != QMessageBox.StandardButton.Yes:
             return
-        for i in reversed(range(self.grid_as.count())):
-            w = self.grid_as.itemAt(i).widget()
-            if w:
-                w.deleteLater()
+        for card in self.asset_cards:
+            card.deleteLater()
+        self.asset_cards.clear()
         self.asset_paths.clear()
+        self.refresh_asset_grid()
     def get_all_assets(self): return self.asset_paths
+
+    def refresh_asset_grid(self):
+        while self.grid_as.count():
+            item = self.grid_as.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+        for i, card in enumerate(self.asset_cards, start=1):
+            card.set_index_badge(i)
+            self.grid_as.addWidget(card, (i - 1) // 2, (i - 1) % 2)
 
     def add_sb_card(self, prompt, ref_urls, img_path=None):
         if isinstance(prompt, dict): prompt = prompt.get('description') or prompt.get('prompt') or str(prompt)
@@ -1107,7 +1172,7 @@ class MainWindow(QMainWindow):
             item = self.grid_sb.takeAt(0)
             if item.widget(): item.widget().setParent(None)
         for i, card in enumerate(self.storyboard_cards):
-            card.chk_sel.setText(f"No.{i+1}")
+            card.update_index_badges(i + 1)
             self.grid_sb.addWidget(card, i//3, i%3)
 
     def reorder_cards(self, src_idx, target_idx):
