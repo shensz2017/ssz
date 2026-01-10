@@ -18,10 +18,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QGridLayout, QComboBox, QProgressBar, QLineEdit, QMessageBox, 
                              QDialog, QFormLayout, QFileDialog, QGroupBox, QSplitter, QSpinBox, 
                              QMenu, QCheckBox, QTabWidget, QGraphicsDropShadowEffect, QSizePolicy)
-from PyQt6.QtCore import (Qt, pyqtSignal, QThread, QMimeData, QObject, pyqtSlot, QRunnable, 
-                          QThreadPool, QTimer, QCoreApplication, QRect, QSize)
-from PyQt6.QtGui import (QPixmap, QDragEnterEvent, QDropEvent, QDrag, QAction, QCursor, 
-                         QTextCursor, QColor, QPalette, QIcon, QFont, QPainter, QAction)
+from PyQt6.QtCore import (Qt, pyqtSignal, QThread, QMimeData, QObject, pyqtSlot, QRunnable,
+                          QThreadPool, QTimer, QCoreApplication, QSize, QUrl)
+from PyQt6.QtGui import (QPixmap, QDragEnterEvent, QDropEvent, QDrag, QAction, QCursor,
+                         QTextCursor, QColor, QPalette, QIcon, QPainter, QDesktopServices)
 
 # ==========================================
 # 0. 全局配置与工具
@@ -39,7 +39,8 @@ else:
 
 CONFIG_FILE = os.path.join(BASE_DIR, "config_grsai.json")
 MAX_ASYNC_WORKERS = 30
-API_TIMEOUT = 300 
+API_TIMEOUT = 300
+CARD_MIME = "application/x-storyboard-card-index"
 
 API_HOST = "https://api.grsai.com"
 URL_CHAT = f"{API_HOST}/v1/chat/completions"       
@@ -111,12 +112,14 @@ class APIClient:
         cleaned = re.sub(r'```', '', cleaned)
         return cleaned.strip()
 
-    def upload_imgbb(self, file_path):
+    def upload_imgbb(self, file_path, name=None):
         if not self.imgbb_key: raise Exception("缺少 ImgBB Key")
         if str(file_path).startswith("http"): return file_path
         try:
             with open(file_path, "rb") as file:
                 payload = {"key": self.imgbb_key}
+                if name:
+                    payload["name"] = str(name)
                 files = {"image": file}
                 res = requests.post(URL_IMGBB, data=payload, files=files, timeout=60)
                 res.raise_for_status()
@@ -274,9 +277,9 @@ class ScriptAnalysisThread(QThread):
         self.log_signal.emit("STEP", "🎬 Script Analysis Started...")
         ref_urls = []
         if self.assets:
-            for path in self.assets:
+            for idx, path in enumerate(self.assets, start=1):
                 if not self.is_running: return
-                u = self.c.upload_imgbb(path)
+                u = self.c.upload_imgbb(path, name=idx)
                 if u: ref_urls.append(u)
         for chunk in self.c.stream_video_script(self.vp, self.m, self.prompt, ref_urls):
             if not self.is_running: break
@@ -316,8 +319,8 @@ class AgentProcessThread(QThread):
             self.log_signal.emit("STEP", f"🚀 Agent: {self.m}")
             ref_urls = []
             if self.assets:
-                for path in self.assets:
-                    u = self.c.upload_imgbb(path)
+                for idx, path in enumerate(self.assets, start=1):
+                    u = self.c.upload_imgbb(path, name=idx)
                     if u: ref_urls.append(u)
             prompts = self.c.agent_multimodal_split(self.s, self.n, self.m, ref_urls) if ref_urls else self.c.chat_split_script(self.s, self.n, self.m)
             if prompts: self.finished_signal.emit(prompts, ref_urls)
@@ -334,9 +337,9 @@ class ImageGenTask(QRunnable):
         try:
             final_urls = []
             if self.urls:
-                for path in self.urls:
+                for idx, path in enumerate(self.urls, start=1):
                     if os.path.exists(path):
-                        u = self.c.upload_imgbb(path)
+                        u = self.c.upload_imgbb(path, name=idx)
                         if u: final_urls.append(u)
                     elif str(path).startswith("http"): final_urls.append(path)
             payload = {"model": self.m, "prompt": self.p, "aspectRatio": self.r, "imageSize": self.s, "urls": final_urls, "webHook": "-1", "shutProgress": False}
@@ -515,7 +518,7 @@ class LogConsole(QTextEdit):
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
 class AssetLabel(QLabel):
-    delete_signal = pyqtSignal(object) 
+    delete_signal = pyqtSignal(object)
     def __init__(self, path):
         super().__init__()
         self.path = path; self.setFixedSize(100, 100)
@@ -551,20 +554,53 @@ class ZoomImageLabel(QLabel):
         super().__init__(text, parent)
         self.full_path = None
         self.cached_pixmap = None
+        self.upload_handler = None
+        self.placeholder_text = text
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet("background-color: #18181b; border-radius: 6px; color: #52525b; font-size: 11px;")
+        self.setAcceptDrops(True)
+        self.setStyleSheet("""background-color: #18181b; border-radius: 6px; color: #52525b; font-size: 11px;
+                               border: 1px dashed #3f3f46;""")
+
+    def set_upload_handler(self, handler, placeholder_text=None):
+        self.upload_handler = handler
+        if placeholder_text:
+            self.placeholder_text = placeholder_text
+        if not self.full_path:
+            self.setText(self.placeholder_text)
 
     def set_image(self, path):
         if path is None:
             self.full_path = None
             self.cached_pixmap = None
-            self.setText("Empty")
+            self.setText(self.placeholder_text)
+            self.setStyleSheet("""background-color: #18181b; border-radius: 6px; color: #6b7280; font-size: 12px;
+                                   border: 1px dashed #52525b;""")
         else:
             self.full_path = path
             self.cached_pixmap = QPixmap(path)
             self.setText("")
+            self.setStyleSheet("background-color: #000000; border-radius: 6px; color: #52525b; font-size: 11px;")
         self.update()
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        if not self.upload_handler:
+            return
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            self.upload_handler(paths[0])
+            event.acceptProposedAction()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and not self.full_path and self.upload_handler:
+            self.upload_handler(None)
+        super().mousePressEvent(event)
 
     def paintEvent(self, event):
         if self.cached_pixmap and not self.cached_pixmap.isNull():
@@ -602,6 +638,8 @@ class StoryboardCard(QWidget):
         self.img_path = None
         self.end_img_path = None
         self.pool = parent_pool; self.client = client; self.mw = main_window; self.ref_urls = ref_urls
+        self.drag_start_pos = None
+        self.setAcceptDrops(True)
         
         self.setFixedWidth(340) 
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.MinimumExpanding)
@@ -633,9 +671,10 @@ class StoryboardCard(QWidget):
         start_group = QGroupBox("🎬 Start Frame"); start_group.setStyleSheet("color:#60a5fa; border:none; font-weight:bold; margin-top:0;")
         l_start = QVBoxLayout(start_group); l_start.setContentsMargins(0,10,0,0)
         
-        self.img = ZoomImageLabel("Double-click to Zoom")
+        self.img = ZoomImageLabel("＋ 上传首帧 (点击或拖拽)")
         self.img.setFixedHeight(160)
         self.img.clear_signal.connect(lambda: self.set_image_by_target(None, "start"))
+        self.img.set_upload_handler(lambda path=None: self.handle_upload("start", path), "＋ 上传首帧 (点击或拖拽)")
         l_start.addWidget(self.img)
 
         self.txt_start = QTextEdit(); self.txt_start.setText(str(prompt)); self.txt_start.setFixedHeight(50)
@@ -661,9 +700,10 @@ class StoryboardCard(QWidget):
         end_group = QGroupBox("🏁 End Frame"); end_group.setStyleSheet("color:#a1a1aa; border:none; font-weight:bold; margin-top:10px;")
         l_end = QVBoxLayout(end_group); l_end.setContentsMargins(0,10,0,0)
         
-        self.img_end_preview = ZoomImageLabel("Double-click to Zoom")
+        self.img_end_preview = ZoomImageLabel("＋ 上传尾帧 (点击或拖拽)")
         self.img_end_preview.setFixedHeight(160)
         self.img_end_preview.clear_signal.connect(lambda: self.set_image_by_target(None, "end"))
+        self.img_end_preview.set_upload_handler(lambda path=None: self.handle_upload("end", path), "＋ 上传尾帧 (点击或拖拽)")
         l_end.addWidget(self.img_end_preview)
 
         self.txt_end = QTextEdit(); self.txt_end.setFixedHeight(50)
@@ -684,12 +724,6 @@ class StoryboardCard(QWidget):
         btns_end.addWidget(self.btn_remake_end); btns_end.addWidget(self.btn_retry_end); btns_end.addWidget(btn_clear_end)
         l_end.addLayout(btns_end)
         
-        btn_upload_end = QPushButton("📂 Upload End Frame (Local)"); 
-        btn_upload_end.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_upload_end.setStyleSheet("""QPushButton { background-color: #27272a; border: 1px dashed #52525b; color: #a1a1aa; padding: 6px; border-radius: 4px; } QPushButton:hover { border: 1px dashed #60a5fa; color: #60a5fa; }""")
-        btn_upload_end.clicked.connect(self.upload_end_frame)
-        l_end.addWidget(btn_upload_end)
-
         l.addWidget(end_group)
 
         # --- SECTION C: VIDEO ACTION ---
@@ -716,14 +750,57 @@ class StoryboardCard(QWidget):
         if menu.exec(self.mapToGlobal(event.pos())) == del_act:
             self.delete_signal.emit(self)
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_start_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton and self.drag_start_pos:
+            if (event.position().toPoint() - self.drag_start_pos).manhattanLength() >= QApplication.startDragDistance():
+                drag = QDrag(self)
+                mime = QMimeData()
+                src_idx = self.mw.storyboard_cards.index(self)
+                mime.setData(CARD_MIME, str(src_idx).encode())
+                drag.setMimeData(mime)
+                drag.setPixmap(self.grab())
+                drag.exec(Qt.DropAction.MoveAction)
+                return
+        super().mouseMoveEvent(event)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(CARD_MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat(CARD_MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasFormat(CARD_MIME):
+            return
+        src_idx = int(bytes(event.mimeData().data(CARD_MIME)).decode())
+        target_idx = self.mw.storyboard_cards.index(self)
+        self.mw.reorder_cards(src_idx, target_idx)
+        event.acceptProposedAction()
+
     def enterEvent(self, event):
         self.container.setStyleSheet("""QFrame#CardFrame { background-color: #27272a; border-radius: 12px; border: 1px solid #60a5fa; }""")
     def leaveEvent(self, event):
         self.container.setStyleSheet("""QFrame#CardFrame { background-color: #27272a; border-radius: 12px; border: 1px solid #3f3f46; }""")
 
-    def upload_end_frame(self):
-        f, _ = QFileDialog.getOpenFileName(self, "End Frame", "", "Images (*.png *.jpg)")
-        if f: self.set_image_by_target(f, "end")
+    def handle_upload(self, target, dropped_path=None):
+        if dropped_path:
+            self.set_image_by_target(dropped_path, target)
+            return
+        dialog_title = "Start Frame" if target == "start" else "End Frame"
+        f, _ = QFileDialog.getOpenFileName(self, dialog_title, "", "Images (*.png *.jpg)")
+        if f:
+            self.set_image_by_target(f, target)
 
     def set_image_by_target(self, path, target):
         if target == "start":
@@ -781,6 +858,7 @@ class StoryboardCard(QWidget):
 
     def update_prompt(self, new_text): 
         self.txt_start.setText(str(new_text)); self.lbl_st.setText("✨ Optimized")
+
         
     @pyqtSlot(object)
     def on_image_success(self, result_tuple):
@@ -861,13 +939,18 @@ class MainWindow(QMainWindow):
         
         # 2. Main Workspace
         gc = QGroupBox("🎬 Director Workspace"); cl = QVBoxLayout(gc)
-        hbox = QHBoxLayout(); self.inp_vid = QLineEdit(); self.inp_vid.setPlaceholderText("Video Path..."); self.inp_vid.setAcceptDrops(True)
+        hbox = QHBoxLayout(); self.inp_vid = QLineEdit(); self.inp_vid.setPlaceholderText("Video Path..."); self.inp_vid.setToolTip("拖拽或粘贴视频路径以便快速分析")
+        self.inp_vid.setAcceptDrops(True)
         self.inp_vid.dragEnterEvent = lambda e: e.accept() if e.mimeData().hasUrls() else e.ignore()
         self.inp_vid.dropEvent = lambda e: self.inp_vid.setText(e.mimeData().urls()[0].toLocalFile())
+        btn_pick_vid = QPushButton("📂 Select Video")
+        btn_pick_vid.setToolTip("选择本地视频文件上传")
+        btn_pick_vid.clicked.connect(self.pick_video_file)
         hbox.addWidget(QLabel("Highlight Count:")); self.sp_ana_cnt = QSpinBox(); self.sp_ana_cnt.setRange(1,12); self.sp_ana_cnt.setValue(4)
         hbox.addWidget(self.sp_ana_cnt)
-        btn_an = QPushButton("🔍 Smart Extract"); btn_an.clicked.connect(self.run_analyze)
-        hbox.addWidget(self.inp_vid); hbox.addWidget(btn_an); cl.addLayout(hbox)
+        btn_an = QPushButton("🔍 Smart Extract"); btn_an.setToolTip("从视频中自动提取精彩片段并生成分镜")
+        btn_an.clicked.connect(self.run_analyze)
+        hbox.addWidget(self.inp_vid); hbox.addWidget(btn_pick_vid); hbox.addWidget(btn_an); cl.addLayout(hbox)
         
         self.tab_widget = QTabWidget()
         
@@ -875,11 +958,17 @@ class MainWindow(QMainWindow):
         tab_sb = QWidget(); l_sb = QVBoxLayout(tab_sb); l_sb.setContentsMargins(10,10,10,10)
         self.sc_sb = QScrollArea(); self.sc_sb.setWidgetResizable(True); self.wid_sb = QWidget(); self.grid_sb = QGridLayout(self.wid_sb)
         self.grid_sb.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft); self.grid_sb.setSpacing(16); self.sc_sb.setWidget(self.wid_sb)
+        self.wid_sb.setAcceptDrops(True)
+        self.wid_sb.dragEnterEvent = lambda e: e.acceptProposedAction() if e.mimeData().hasFormat(CARD_MIME) else e.ignore()
+        self.wid_sb.dropEvent = lambda e: self.reorder_cards(int(bytes(e.mimeData().data(CARD_MIME)).decode()), len(self.storyboard_cards)-1) or e.acceptProposedAction()
         manage_box = QHBoxLayout()
         btn_imp = QPushButton("📥 Import Image"); btn_imp.clicked.connect(self.import_storyboard_image)
         btn_bat = QPushButton("🎨 Batch Draw"); btn_bat.setObjectName("PrimaryBtn"); btn_bat.clicked.connect(self.batch_remake)
         btn_cls = QPushButton("🗑️ Delete All"); btn_cls.setObjectName("DangerBtn"); btn_cls.clicked.connect(self.clear_all_storyboards)
-        manage_box.addWidget(btn_imp); manage_box.addWidget(btn_bat); manage_box.addStretch(); manage_box.addWidget(btn_cls)
+        btn_open_out = QPushButton("📂 Open Storyboards")
+        btn_open_out.setToolTip("打开分镜输出文件夹，便捷查看最新生成的图片")
+        btn_open_out.clicked.connect(lambda: self.open_dir(self.out_dir))
+        manage_box.addWidget(btn_imp); manage_box.addWidget(btn_bat); manage_box.addWidget(btn_open_out); manage_box.addStretch(); manage_box.addWidget(btn_cls)
         l_sb.addWidget(self.sc_sb); l_sb.addLayout(manage_box)
         self.tab_widget.addTab(tab_sb, "🖼️ Storyboard")
         
@@ -910,7 +999,8 @@ class MainWindow(QMainWindow):
         # Restore Models
         self.cb_agent = QComboBox(); self.cb_agent.setEditable(True); self.cb_agent.addItems(["gemini-3-pro", "gemini-2.5-pro", "gemini-2.5-flash"]); fl1.addRow("Model:", self.cb_agent)
         self.sp_cnt = QSpinBox(); self.sp_cnt.setRange(1,30); self.sp_cnt.setValue(4); fl1.addRow("Count:", self.sp_cnt)
-        self.btn_ag = QPushButton("🚀 Split & Gen"); self.btn_ag.setObjectName("PrimaryBtn"); self.btn_ag.clicked.connect(self.run_agent_flow)
+        self.btn_ag = QPushButton("🚀 Split & Gen"); self.btn_ag.setObjectName("PrimaryBtn"); self.btn_ag.setToolTip("根据故事创意自动拆分分镜并绘制")
+        self.btn_ag.clicked.connect(self.run_agent_flow)
         fl1.addRow(self.btn_ag); g1.setLayout(fl1); rl.addWidget(g1)
         
         g2 = QGroupBox("🎨 Image"); fl2 = QFormLayout()
@@ -924,6 +1014,10 @@ class MainWindow(QMainWindow):
         self.cb_vr = QComboBox(); self.cb_vr.addItems(["16:9", "9:16"]); fl3.addRow("Ratio:", self.cb_vr)
         btn_optimize = QPushButton("✨ Auto Prompt"); btn_optimize.clicked.connect(self.run_prompt_optimization); fl3.addRow(btn_optimize)
         btn_vid = QPushButton("🎬 Batch Video"); btn_vid.setObjectName("PrimaryBtn"); btn_vid.clicked.connect(self.run_video_flow); fl3.addRow(btn_vid)
+        btn_open_video = QPushButton("📂 Open Videos")
+        btn_open_video.setToolTip("快速打开视频输出文件夹，查看生成结果")
+        btn_open_video.clicked.connect(lambda: self.open_dir(self.out_dir_video))
+        fl3.addRow(btn_open_video)
         self.lbl_vid_progress = QLabel("Prog: -/-"); fl3.addRow(self.lbl_vid_progress)
         g3.setLayout(fl3); rl.addWidget(g3); rl.addStretch(); tl.addWidget(fr)
         
@@ -970,6 +1064,11 @@ class MainWindow(QMainWindow):
         c.insertText(chunk)
         self.txt_script_out.setTextCursor(c)
 
+    def pick_video_file(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Videos (*.mp4 *.mov *.mkv *.avi)")
+        if f:
+            self.inp_vid.setText(f)
+
     def upload_as(self):
         f, _ = QFileDialog.getOpenFileName(self, "Img", "", "Images (*.png *.jpg *.jpeg)")
         if f: self.add_asset_card(f)
@@ -985,8 +1084,15 @@ class MainWindow(QMainWindow):
         self.grid_as.removeWidget(widget); widget.deleteLater()
         if widget.path in self.asset_paths: self.asset_paths.remove(widget.path)
     def clear_assets(self):
-        for i in reversed(range(self.grid_as.count())): w = self.grid_as.itemAt(i).widget(); 
-        if w: w.deleteLater()
+        if not self.asset_paths:
+            return
+        resp = QMessageBox.question(self, "Confirm", "确定要清空已导入的素材吗？这不会删除磁盘上的文件。", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        for i in reversed(range(self.grid_as.count())):
+            w = self.grid_as.itemAt(i).widget()
+            if w:
+                w.deleteLater()
         self.asset_paths.clear()
     def get_all_assets(self): return self.asset_paths
 
@@ -1015,9 +1121,30 @@ class MainWindow(QMainWindow):
             card.chk_sel.setText(f"No.{i+1}")
             self.grid_sb.addWidget(card, i//3, i%3)
 
+    def reorder_cards(self, src_idx, target_idx):
+        if src_idx < 0 or src_idx >= len(self.storyboard_cards):
+            return
+        target_idx = max(0, min(target_idx, len(self.storyboard_cards)-1))
+        if src_idx == target_idx:
+            return
+        card = self.storyboard_cards.pop(src_idx)
+        self.storyboard_cards.insert(target_idx, card)
+        self.refresh_sb_grid()
+
     def clear_all_storyboards(self):
-        for c in self.storyboard_cards: c.deleteLater()
+        if not self.storyboard_cards:
+            return
+        resp = QMessageBox.question(self, "Confirm", "删除所有分镜卡片？此操作不可撤销。", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        for c in self.storyboard_cards:
+            c.deleteLater()
         self.storyboard_cards.clear(); self.refresh_sb_grid()
+
+    def open_dir(self, path):
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def import_storyboard_image(self):
         f, _ = QFileDialog.getOpenFileName(self, "Import", "", "Images (*.png *.jpg)")
