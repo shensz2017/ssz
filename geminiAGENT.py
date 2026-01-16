@@ -7,9 +7,10 @@ import base64
 import threading
 import re
 import traceback
-import numpy as np 
-import cv2 
+import numpy as np
+import cv2
 import math
+import shutil
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -47,6 +48,7 @@ URL_DRAW_NANO = f"{API_HOST}/v1/draw/nano-banana"
 URL_VIDEO_VEO = f"{API_HOST}/v1/video/veo"         
 URL_RESULT = f"{API_HOST}/v1/draw/result"          
 URL_IMGBB = "https://api.imgbb.com/1/upload"       
+URL_SCREENING_CHAT = "https://grsaiapi.com/v1/chat/completions"
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -63,6 +65,24 @@ def ensure_dir(dir_name):
     if not os.path.exists(full_path):
         os.makedirs(full_path)
     return os.path.abspath(full_path)
+
+def list_image_files(root_dir):
+    image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    results = []
+    for dirpath, _, filenames in os.walk(root_dir):
+        for name in filenames:
+            _, ext = os.path.splitext(name)
+            if ext.lower() in image_exts:
+                results.append(os.path.join(dirpath, name))
+    return results
+
+def extract_group_key(filename):
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    match = re.search(r'[A-Za-z]+\\d+', stem)
+    if match:
+        return match.group(0)
+    parts = re.split(r'[_\\-\\s]+', stem)
+    return parts[0] if parts else stem
 
 def cv2_save_image_safe(path, img):
     try:
@@ -105,11 +125,39 @@ class APIClient:
             "Authorization": f"Bearer {self.grsai_key}"
         }
 
+    def update_key(self, grsai_key, imgbb_key=None):
+        self.grsai_key = grsai_key
+        if imgbb_key is not None:
+            self.imgbb_key = imgbb_key
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.grsai_key}"
+        }
+
     def _clean_gemini_output(self, raw_text):
         cleaned = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL)
         cleaned = re.sub(r'```json', '', cleaned)
         cleaned = re.sub(r'```', '', cleaned)
         return cleaned.strip()
+
+    def chat_with_images(self, model, prompt, image_paths):
+        user_content = [{"type": "text", "text": prompt}]
+        for path in image_paths:
+            with open(path, "rb") as img_file:
+                img_b64 = base64.b64encode(img_file.read()).decode("utf-8")
+            ext = os.path.splitext(path)[1].lower()
+            mime = "image/jpeg" if ext in {".jpg", ".jpeg"} else "image/png"
+            data_uri = f"data:{mime};base64,{img_b64}"
+            user_content.append({"type": "image_url", "image_url": {"url": data_uri}})
+
+        payload = {
+            "model": model,
+            "stream": False,
+            "messages": [{"role": "user", "content": user_content}]
+        }
+        response = requests.post(URL_SCREENING_CHAT, headers=self.headers, json=payload, timeout=API_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
 
     def upload_imgbb(self, file_path):
         if not self.imgbb_key: raise Exception("缺少 ImgBB Key")
@@ -264,6 +312,34 @@ class WorkerSignals(QObject):
     finished = pyqtSignal(object) 
     error = pyqtSignal(str) 
     progress = pyqtSignal(str)
+
+class ScreeningSignals(QObject):
+    finished = pyqtSignal(str, str, str)
+    error = pyqtSignal(str, str)
+
+def parse_screening_result(text):
+    match = re.search(r'(正确|错误)', text)
+    return match.group(1) if match else "未识别"
+
+class ScreeningTask(QRunnable):
+    def __init__(self, client, task_id, model, prompt, image_paths):
+        super().__init__()
+        self.client = client
+        self.task_id = task_id
+        self.model = model
+        self.prompt = prompt
+        self.image_paths = image_paths
+        self.signals = ScreeningSignals()
+
+    def run(self):
+        try:
+            response = self.client.chat_with_images(self.model, self.prompt, self.image_paths)
+            message = response["choices"][0]["message"]["content"]
+            cleaned = self.client._clean_gemini_output(message)
+            verdict = parse_screening_result(cleaned)
+            self.signals.finished.emit(self.task_id, verdict, cleaned)
+        except Exception as exc:
+            self.signals.error.emit(self.task_id, str(exc))
 
 class ScriptAnalysisThread(QThread):
     chunk_received = pyqtSignal(str); finished_signal = pyqtSignal(); log_signal = pyqtSignal(str, str)
@@ -799,6 +875,136 @@ class StoryboardCard(QWidget):
     def on_video_progress(self, msg): self.lbl_st.setText(msg)
 
 # ==========================================
+# 4.5 筛查任务调度
+# ==========================================
+class ScreeningQueueManager(QObject):
+    def __init__(self, pool, max_workers=30, interval_ms=500):
+        super().__init__()
+        self.pool = pool
+        self.queue = []
+        self.active = 0
+        self.max_workers = max_workers
+        self.timer = QTimer()
+        self.timer.setInterval(interval_ms)
+        self.timer.timeout.connect(self._dispatch_next)
+
+    def enqueue(self, task):
+        self.queue.append(task)
+        if not self.timer.isActive():
+            self.timer.start()
+
+    def _dispatch_next(self):
+        if self.queue and self.active < self.max_workers:
+            task = self.queue.pop(0)
+            self.active += 1
+            task.signals.finished.connect(self._on_task_done)
+            task.signals.error.connect(self._on_task_error)
+            self.pool.start(task)
+        if not self.queue and self.active == 0:
+            self.timer.stop()
+
+    def _on_task_done(self, *_args):
+        self.active = max(0, self.active - 1)
+
+    def _on_task_error(self, *_args):
+        self.active = max(0, self.active - 1)
+
+# ==========================================
+# 4.6 筛查 UI 组件
+# ==========================================
+class ScreeningTaskWidget(QWidget):
+    def __init__(self, task_id, title, image_paths, default_prompt):
+        super().__init__()
+        self.task_id = task_id
+        self.title = title
+        self.image_paths = image_paths
+        self.setStyleSheet("background-color:#27272a; border:1px solid #3f3f46; border-radius:8px;")
+
+        layout = QVBoxLayout(self)
+        header = QHBoxLayout()
+        self.lbl_title = QLabel(title)
+        self.lbl_status = QLabel("待处理")
+        self.lbl_status.setStyleSheet("color:#a1a1aa;")
+        header.addWidget(self.lbl_title)
+        header.addStretch()
+        header.addWidget(self.lbl_status)
+        layout.addLayout(header)
+
+        self.txt_prompt = QTextEdit()
+        self.txt_prompt.setPlaceholderText("请输入提示词...")
+        self.txt_prompt.setText(default_prompt)
+        self.txt_prompt.setFixedHeight(60)
+        layout.addWidget(self.txt_prompt)
+
+        info = QLabel(" / ".join([os.path.basename(p) for p in image_paths]))
+        info.setStyleSheet("color:#71717a; font-size:11px;")
+        layout.addWidget(info)
+
+    def set_prompt(self, text):
+        self.txt_prompt.setText(text)
+
+    def prompt(self):
+        return self.txt_prompt.toPlainText().strip()
+
+    def set_status(self, verdict, is_error=False):
+        if verdict == "正确":
+            self.lbl_status.setText("✅ 正确")
+            self.lbl_status.setStyleSheet("color:#4ade80;")
+        elif verdict == "错误":
+            self.lbl_status.setText("❌ 错误")
+            self.lbl_status.setStyleSheet("color:#f87171;")
+        else:
+            color = "#facc15" if is_error else "#a1a1aa"
+            self.lbl_status.setText(verdict)
+            self.lbl_status.setStyleSheet(f"color:{color};")
+
+class ScreeningSingleTaskWidget(QWidget):
+    def __init__(self, task_id, title, image_path, default_prompt):
+        super().__init__()
+        self.task_id = task_id
+        self.title = title
+        self.image_path = image_path
+        self.setStyleSheet("background-color:#27272a; border:1px solid #3f3f46; border-radius:8px;")
+
+        layout = QVBoxLayout(self)
+        header = QHBoxLayout()
+        self.lbl_title = QLabel(title)
+        self.lbl_status = QLabel("待处理")
+        self.lbl_status.setStyleSheet("color:#a1a1aa;")
+        header.addWidget(self.lbl_title)
+        header.addStretch()
+        header.addWidget(self.lbl_status)
+        layout.addLayout(header)
+
+        self.txt_prompt = QTextEdit()
+        self.txt_prompt.setPlaceholderText("请输入提示词...")
+        self.txt_prompt.setText(default_prompt)
+        self.txt_prompt.setFixedHeight(60)
+        layout.addWidget(self.txt_prompt)
+
+        info = QLabel(os.path.basename(image_path))
+        info.setStyleSheet("color:#71717a; font-size:11px;")
+        layout.addWidget(info)
+
+    def set_prompt(self, text):
+        self.txt_prompt.setText(text)
+
+    def prompt(self):
+        return self.txt_prompt.toPlainText().strip()
+
+    def set_status(self, verdict, is_error=False):
+        if verdict == "正确":
+            self.lbl_status.setText("✅ 正确")
+            self.lbl_status.setStyleSheet("color:#4ade80;")
+        elif verdict == "错误":
+            self.lbl_status.setText("❌ 错误")
+            self.lbl_status.setStyleSheet("color:#f87171;")
+        else:
+            color = "#facc15" if is_error else "#a1a1aa"
+            self.lbl_status.setText(verdict)
+            self.lbl_status.setStyleSheet(f"color:{color};")
+
+# ==========================================
 # 5. 主程序窗口
 # ==========================================
 class MainWindow(QMainWindow):
@@ -811,7 +1017,14 @@ class MainWindow(QMainWindow):
         self.out_dir = ensure_dir("Storyboards_Output")
         self.out_dir_video = ensure_dir("Final_Videos") 
         ensure_dir("Highlights")
+        self.pending_dir = ensure_dir("Pending processing")
+        self.first_screening_dir = ensure_dir("First step screening")
+        self.second_screening_dir = ensure_dir("Second step screening")
         self.asset_paths = []; self.storyboard_cards = []
+        self.screening_queue = ScreeningQueueManager(self.pool, MAX_ASYNC_WORKERS, 500)
+        self.first_tasks = {}
+        self.second_tasks = {}
+        self.compare_library = []
         self.setup_ui(); self.apply_theme()
         if not self.client.grsai_key: global_logger.warn("⚠️ Please Config API Key")
         else: global_logger.info(f"✅ System Ready")
@@ -845,6 +1058,19 @@ class MainWindow(QMainWindow):
         sp = QSplitter(Qt.Orientation.Vertical); self.setCentralWidget(sp)
         top = QWidget(); tl = QHBoxLayout(top); tl.setContentsMargins(16,16,16,16); tl.setSpacing(16)
         
+        # 0. API Key
+        api_group = QGroupBox("🔑 API Key")
+        api_layout = QVBoxLayout(api_group)
+        self.api_input = QLineEdit()
+        self.api_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_input.setPlaceholderText("输入并保存 API Key")
+        self.api_input.setText(self.client.grsai_key)
+        btn_save_key = QPushButton("💾 保存")
+        btn_save_key.setObjectName("PrimaryBtn")
+        btn_save_key.clicked.connect(self.save_api_key)
+        api_layout.addWidget(self.api_input)
+        api_layout.addWidget(btn_save_key)
+
         # 1. Assets
         gl = QGroupBox("📂 Assets Library"); ll = QVBoxLayout(gl)
         self.sc_as = QScrollArea(); self.sc_as.setWidgetResizable(True)
@@ -857,7 +1083,14 @@ class MainWindow(QMainWindow):
         btn_up = QPushButton("➕ Upload"); btn_up.clicked.connect(self.upload_as)
         btn_cl = QPushButton("🗑️ Clear"); btn_cl.setObjectName("DangerBtn"); btn_cl.clicked.connect(self.clear_assets)
         btn_box.addWidget(btn_up); btn_box.addWidget(btn_cl)
-        ll.addLayout(btn_box); tl.addWidget(gl, 1)
+        ll.addLayout(btn_box)
+
+        left_container = QWidget()
+        left_layout = QVBoxLayout(left_container)
+        left_layout.setSpacing(16)
+        left_layout.addWidget(api_group)
+        left_layout.addWidget(gl, 1)
+        tl.addWidget(left_container, 1)
         
         # 2. Main Workspace
         gc = QGroupBox("🎬 Director Workspace"); cl = QVBoxLayout(gc)
@@ -898,6 +1131,101 @@ class MainWindow(QMainWindow):
         sc_box.addWidget(self.txt_manual); sc_box.addWidget(self.btn_toggle_script)
         l_sc.addWidget(self.txt_script_out); l_sc.addLayout(sc_box)
         self.tab_widget.addTab(tab_sc, "📝 Script Agent")
+
+        # Tab 3: First Screening
+        tab_first = QWidget(); l_first = QVBoxLayout(tab_first); l_first.setContentsMargins(10,10,10,10)
+        first_controls = QHBoxLayout()
+        btn_first_folder = QPushButton("📂 选择文件夹")
+        btn_first_folder.clicked.connect(self.load_first_folder)
+        btn_first_start = QPushButton("🚀 开始筛查")
+        btn_first_start.setObjectName("PrimaryBtn")
+        btn_first_start.clicked.connect(self.start_first_screening)
+        self.lbl_first_count = QLabel("任务数: 0")
+        first_controls.addWidget(btn_first_folder)
+        first_controls.addWidget(btn_first_start)
+        first_controls.addStretch()
+        first_controls.addWidget(self.lbl_first_count)
+        l_first.addLayout(first_controls)
+
+        batch_row = QHBoxLayout()
+        self.first_prompt_template = QTextEdit()
+        self.first_prompt_template.setFixedHeight(80)
+        self.first_prompt_template.setText("分析这两张图片是否以皮克斯动画的风格转换成功，人物或动物在数量、特征，服装款式，人物动作，底座数量是否唯一等方面是否符合标准，是否出现缺胳膊少腿，多手等AI生图普遍错误情况，你只需要用中文回复“正确”和“错误”")
+        btn_fill_all = QPushButton("填充所有")
+        btn_fill_all.clicked.connect(lambda: self.fill_first_prompts(force=False))
+        btn_force_all = QPushButton("强制覆盖")
+        btn_force_all.clicked.connect(lambda: self.fill_first_prompts(force=True))
+        batch_row.addWidget(self.first_prompt_template, 1)
+        batch_btns = QVBoxLayout()
+        batch_btns.addWidget(btn_fill_all)
+        batch_btns.addWidget(btn_force_all)
+        batch_row.addLayout(batch_btns)
+        l_first.addLayout(batch_row)
+
+        self.first_task_area = QScrollArea()
+        self.first_task_area.setWidgetResizable(True)
+        self.first_task_container = QWidget()
+        self.first_task_layout = QVBoxLayout(self.first_task_container)
+        self.first_task_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.first_task_area.setWidget(self.first_task_container)
+        l_first.addWidget(self.first_task_area)
+        self.tab_widget.addTab(tab_first, "第一次筛查")
+
+        # Tab 4: Second Screening
+        tab_second = QWidget(); l_second = QHBoxLayout(tab_second); l_second.setContentsMargins(10,10,10,10)
+        left_panel = QGroupBox("对照库")
+        left_layout = QVBoxLayout(left_panel)
+        btn_compare_folder = QPushButton("📥 上传对照库文件夹")
+        btn_compare_folder.clicked.connect(self.load_compare_library)
+        left_layout.addWidget(btn_compare_folder)
+        self.compare_area = QScrollArea()
+        self.compare_area.setWidgetResizable(True)
+        self.compare_container = QWidget()
+        self.compare_layout = QVBoxLayout(self.compare_container)
+        self.compare_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.compare_area.setWidget(self.compare_container)
+        left_layout.addWidget(self.compare_area)
+        l_second.addWidget(left_panel, 1)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        second_controls = QHBoxLayout()
+        btn_second_folder = QPushButton("📂 上传筛查文件夹")
+        btn_second_folder.clicked.connect(self.load_second_folder)
+        btn_second_start = QPushButton("🚀 开始筛查")
+        btn_second_start.setObjectName("PrimaryBtn")
+        btn_second_start.clicked.connect(self.start_second_screening)
+        self.lbl_second_count = QLabel("任务数: 0")
+        second_controls.addWidget(btn_second_folder)
+        second_controls.addWidget(btn_second_start)
+        second_controls.addStretch()
+        second_controls.addWidget(self.lbl_second_count)
+        right_layout.addLayout(second_controls)
+
+        second_batch_row = QHBoxLayout()
+        self.second_prompt_template = QTextEdit()
+        self.second_prompt_template.setFixedHeight(80)
+        self.second_prompt_template.setText("分析两张图片，摆件图的底座是否和白底图的底座在基本的颜色，款式上大体一致，有略微形状不同可视为正确，你只需要回复“正确”和“错误”")
+        btn_second_fill = QPushButton("填充所有")
+        btn_second_fill.clicked.connect(lambda: self.fill_second_prompts(force=False))
+        btn_second_force = QPushButton("强制覆盖")
+        btn_second_force.clicked.connect(lambda: self.fill_second_prompts(force=True))
+        second_batch_row.addWidget(self.second_prompt_template, 1)
+        second_btns = QVBoxLayout()
+        second_btns.addWidget(btn_second_fill)
+        second_btns.addWidget(btn_second_force)
+        second_batch_row.addLayout(second_btns)
+        right_layout.addLayout(second_batch_row)
+
+        self.second_task_area = QScrollArea()
+        self.second_task_area.setWidgetResizable(True)
+        self.second_task_container = QWidget()
+        self.second_task_layout = QVBoxLayout(self.second_task_container)
+        self.second_task_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.second_task_area.setWidget(self.second_task_container)
+        right_layout.addWidget(self.second_task_area)
+        l_second.addWidget(right_panel, 3)
+        self.tab_widget.addTab(tab_second, "第二次筛查")
         
         cl.addWidget(self.tab_widget); tl.addWidget(gc, 3)
         
@@ -1099,13 +1427,169 @@ class MainWindow(QMainWindow):
             card.error_signal.connect(lambda _, c=update_prog: c())
             card.start_video_gen()
 
+    def clear_layout_widgets(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+
+    def load_first_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择图片文件夹")
+        if not folder:
+            return
+        self.clear_layout_widgets(self.first_task_layout)
+        self.first_tasks.clear()
+        groups = {}
+        for path in list_image_files(folder):
+            key = extract_group_key(path)
+            groups.setdefault(key, []).append(path)
+        for key in sorted(groups.keys()):
+            images = sorted(groups[key])
+            if len(images) < 2:
+                continue
+            target_dir = os.path.join(self.pending_dir, key)
+            if os.path.exists(target_dir):
+                shutil.rmtree(target_dir)
+            os.makedirs(target_dir, exist_ok=True)
+            selected = []
+            for src in images[:2]:
+                dest = os.path.join(target_dir, os.path.basename(src))
+                shutil.copy2(src, dest)
+                selected.append(dest)
+            widget = ScreeningTaskWidget(key, key, selected, self.first_prompt_template.toPlainText())
+            self.first_task_layout.addWidget(widget)
+            self.first_tasks[key] = {"widget": widget, "folder": target_dir, "images": selected}
+        self.lbl_first_count.setText(f"任务数: {len(self.first_tasks)}")
+        global_logger.info(f"📂 第一次筛查任务加载完成: {len(self.first_tasks)}")
+
+    def fill_first_prompts(self, force=False):
+        template = self.first_prompt_template.toPlainText().strip()
+        for task in self.first_tasks.values():
+            widget = task["widget"]
+            if force or not widget.prompt():
+                widget.set_prompt(template)
+
+    def start_first_screening(self):
+        if not self.first_tasks:
+            global_logger.warn("⚠️ 没有需要筛查的任务")
+            return
+        for task_id, task in self.first_tasks.items():
+            widget = task["widget"]
+            prompt = widget.prompt() or self.first_prompt_template.toPlainText().strip()
+            if not prompt:
+                widget.set_status("提示词为空", is_error=True)
+                continue
+            widget.set_status("排队中")
+            screening_task = ScreeningTask(self.client, task_id, "gemini-3-pro", prompt, task["images"])
+            screening_task.signals.finished.connect(self.handle_first_result)
+            screening_task.signals.error.connect(self.handle_first_error)
+            self.screening_queue.enqueue(screening_task)
+
+    def handle_first_result(self, task_id, verdict, raw_text):
+        task = self.first_tasks.get(task_id)
+        if not task:
+            return
+        widget = task["widget"]
+        widget.set_status(verdict)
+        if verdict == "错误":
+            dest = os.path.join(self.first_screening_dir, task_id)
+            if os.path.exists(dest):
+                shutil.rmtree(dest)
+            shutil.copytree(task["folder"], dest)
+        global_logger.info(f"✅ 第一次筛查完成 {task_id}: {verdict}")
+
+    def handle_first_error(self, task_id, error):
+        task = self.first_tasks.get(task_id)
+        if not task:
+            return
+        task["widget"].set_status(f"失败: {error}", is_error=True)
+        global_logger.error(f"第一次筛查失败 {task_id}: {error}")
+
+    def load_compare_library(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择对照库文件夹")
+        if not folder:
+            return
+        self.compare_library = list_image_files(folder)
+        self.clear_layout_widgets(self.compare_layout)
+        for path in self.compare_library:
+            label = QLabel(os.path.basename(path))
+            label.setStyleSheet("color:#a1a1aa; font-size:11px;")
+            self.compare_layout.addWidget(label)
+        global_logger.info(f"📚 对照库图片数量: {len(self.compare_library)}")
+
+    def load_second_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择筛查文件夹")
+        if not folder:
+            return
+        self.clear_layout_widgets(self.second_task_layout)
+        self.second_tasks.clear()
+        for idx, path in enumerate(sorted(list_image_files(folder))):
+            task_id = f"task_{idx+1}"
+            widget = ScreeningSingleTaskWidget(task_id, task_id, path, self.second_prompt_template.toPlainText())
+            self.second_task_layout.addWidget(widget)
+            self.second_tasks[task_id] = {"widget": widget, "image": path}
+        self.lbl_second_count.setText(f"任务数: {len(self.second_tasks)}")
+        global_logger.info(f"📂 第二次筛查任务加载完成: {len(self.second_tasks)}")
+
+    def fill_second_prompts(self, force=False):
+        template = self.second_prompt_template.toPlainText().strip()
+        for task in self.second_tasks.values():
+            widget = task["widget"]
+            if force or not widget.prompt():
+                widget.set_prompt(template)
+
+    def start_second_screening(self):
+        if not self.second_tasks:
+            global_logger.warn("⚠️ 没有需要筛查的任务")
+            return
+        if not self.compare_library:
+            global_logger.warn("⚠️ 请先加载对照库")
+            return
+        for task_id, task in self.second_tasks.items():
+            widget = task["widget"]
+            prompt = widget.prompt() or self.second_prompt_template.toPlainText().strip()
+            if not prompt:
+                widget.set_status("提示词为空", is_error=True)
+                continue
+            widget.set_status("排队中")
+            images = [task["image"]] + self.compare_library
+            screening_task = ScreeningTask(self.client, task_id, "gemini-3-pro", prompt, images)
+            screening_task.signals.finished.connect(self.handle_second_result)
+            screening_task.signals.error.connect(self.handle_second_error)
+            self.screening_queue.enqueue(screening_task)
+
+    def handle_second_result(self, task_id, verdict, raw_text):
+        task = self.second_tasks.get(task_id)
+        if not task:
+            return
+        widget = task["widget"]
+        widget.set_status(verdict)
+        if verdict == "错误":
+            dest = os.path.join(self.second_screening_dir, os.path.basename(task["image"]))
+            shutil.copy2(task["image"], dest)
+        global_logger.info(f"✅ 第二次筛查完成 {task_id}: {verdict}")
+
+    def handle_second_error(self, task_id, error):
+        task = self.second_tasks.get(task_id)
+        if not task:
+            return
+        task["widget"].set_status(f"失败: {error}", is_error=True)
+        global_logger.error(f"第二次筛查失败 {task_id}: {error}")
+
+    def save_api_key(self):
+        key = self.api_input.text().strip()
+        save_config(key, self.client.imgbb_key)
+        self.client.update_key(key, self.client.imgbb_key)
+        global_logger.info("✅ API Key Saved")
+
     def open_settings(self):
         d=QDialog(self); d.setWindowTitle("Settings"); l=QFormLayout(d)
         k1=QLineEdit(load_config().get("grsai_key")); k1.setEchoMode(QLineEdit.EchoMode.Password)
         k2=QLineEdit(load_config().get("imgbb_key")); k2.setEchoMode(QLineEdit.EchoMode.Password)
         l.addRow("GRSAI Key:", k1); l.addRow("ImgBB Key:", k2)
         b=QPushButton("Save"); b.setObjectName("PrimaryBtn")
-        b.clicked.connect(lambda: (save_config(k1.text(), k2.text()), self.client.__init__(), d.accept())); l.addRow(b); d.exec()
+        b.clicked.connect(lambda: (save_config(k1.text(), k2.text()), self.client.update_key(k1.text(), k2.text()), self.api_input.setText(k1.text()), d.accept())); l.addRow(b); d.exec()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
